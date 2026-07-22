@@ -188,6 +188,7 @@ import re
 import secrets
 import socket
 import time
+import concurrent.futures
 
 app = Flask(__name__)
 
@@ -249,29 +250,39 @@ def norm_rule(data):
         return None, 'VPS 端口 %s 与面板/Caddy 保留端口冲突' % vport
     return {'emby_host': host, 'emby_port': eport, 'vps_port': vport}, None
 
-def tcp_latency(host, port, count=3, timeout=2):
-    """测量 VPS 到目标 host:port 的 TCP 建连时间(≈RTT)，返回毫秒；全部失败返回 None"""
+# ===== 延迟检测：线程池 + 硬超时（DNS 解析挂死也会被强制放弃）=====
+_ping_pool = concurrent.futures.ThreadPoolExecutor(max_workers=8)
+
+def _tcp_once(host, port, timeout):
+    s = None
+    try:
+        start = time.monotonic()
+        s = socket.create_connection((host, port), timeout=timeout)
+        return (time.monotonic() - start) * 1000
+    except Exception:
+        return None
+    finally:
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
+
+def tcp_latency(host, port, count=2, timeout=2):
+    """测 VPS 到 host:port 的 TCP 建连时间(≈RTT)，返回毫秒；失败返回 None"""
     times = []
     for _ in range(count):
-        s = None
         try:
-            start = time.monotonic()
-            s = socket.create_connection((host, port), timeout=timeout)
-            times.append((time.monotonic() - start) * 1000)
+            t = _ping_pool.submit(_tcp_once, host, port, timeout).result(timeout=timeout + 5)
         except Exception:
-            pass
-        finally:
-            if s is not None:
-                try:
-                    s.close()
-                except Exception:
-                    pass
+            t = None
+        if t is not None:
+            times.append(t)
     if not times:
         return None
     return int(sum(times) / len(times))
 
 def generate_and_reload_caddy():
-    """生成完整 Caddyfile -> 校验通过才落地 -> 同步 reload 并检查结果。"""
     domain = get_domain()
     rules = load_rules()
     content = "%s {\n    reverse_proxy 127.0.0.1:5000\n}\n\n" % domain
@@ -408,14 +419,27 @@ PANEL_HTML = """
         window.onload = loadRules;
 
         async function loadRules() {
-            const res = await fetch('/api/list');
-            const data = await res.json();
+            const status = document.getElementById('status');
+            let data;
+            try {
+                const res = await fetch('/api/list');
+                data = await res.json();
+            } catch (e) {
+                status.style.color = 'red';
+                status.innerText = '规则列表加载失败（登录可能已过期，请重新登录）';
+                return;
+            }
+            if (!data || !Array.isArray(data.rules)) {
+                status.style.color = 'red';
+                status.innerText = '规则列表加载失败：后端返回异常';
+                return;
+            }
             const tbody = document.getElementById('ruleList');
-            tbody.innerHTML = '';
-            data.rules.forEach(rule => {
+            // 修复点：先拼好全部行，一次性赋值，避免 innerHTML+= 循环重建导致节点失效
+            const rows = data.rules.map(rule => {
                 const url = 'https://' + data.domain + ':' + rule.vps_port;
                 const pingId = 'ping-' + rule.vps_port;
-                tbody.innerHTML += '<tr>' +
+                return '<tr>' +
                     '<td><a class="link" href="' + url + '" target="_blank"><strong>' + url + '</strong></a></td>' +
                     '<td>' + rule.emby_host + '</td>' +
                     '<td>' + rule.emby_port + '</td>' +
@@ -425,12 +449,16 @@ PANEL_HTML = """
                         '<button class="delete-btn" onclick="deleteRule(' + rule.vps_port + ')">删除并释放</button>' +
                     '</td>' +
                     '</tr>';
-                pingRule(rule.emby_host, rule.emby_port, pingId);
+            });
+            tbody.innerHTML = rows.join('');
+            data.rules.forEach(rule => {
+                pingRule(rule.emby_host, rule.emby_port, 'ping-' + rule.vps_port);
             });
         }
 
         async function pingRule(host, port, cellId) {
             const cell = document.getElementById(cellId);
+            if (!cell) return;
             try {
                 const res = await fetch('/api/ping', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ emby_host: host, emby_port: port }) });
                 const result = await res.json();
@@ -625,12 +653,10 @@ def edit_rule():
     if idx is None:
         return jsonify({"success": False, "message": "原规则不存在（可能已被删除）"})
 
-    # 新端口与其他规则冲突检查（排除自己）
     for i, r in enumerate(rules):
         if i != idx and int(r['vps_port']) == rule['vps_port']:
             return jsonify({"success": False, "message": "新 VPS 端口已被其他规则占用"})
 
-    # 换了端口才需要检查系统占用（没换则仍是 caddy 自己持有）
     if rule['vps_port'] != old_port:
         r = subprocess.run(['ss', '-lntHp', 'sport = :%s' % rule['vps_port']],
                            capture_output=True, text=True)
@@ -738,16 +764,14 @@ EOF
     systemctl is-active --quiet caddy || echo -e "${RED}⚠️ caddy 未在运行，请 journalctl -u caddy -n 50 排查${RESET}"
     systemctl is-active --quiet emby-proxy-web || echo -e "${RED}⚠️ 面板服务未在运行，请 journalctl -u emby-proxy-web -n 50 排查${RESET}"
 
-    if [ ! -f "/usr/local/bin/emby-proxy" ]; then
-        cat > /usr/local/bin/emby-proxy <<'EOF_SC'
+    # 快捷指令：每次安装都强制覆盖为新版（破缓存+防管道冲突），不再"不存在才创建"
+    cat > /usr/local/bin/emby-proxy <<'EOF_SC'
 #!/bin/bash
 curl -fsSL --max-time 30 "https://raw.githubusercontent.com/JBl9527/emby-proxy/main/proxy_emby.sh?t=$(date +%s)" -o /tmp/proxy_emby.sh || { echo "下载失败"; exit 1; }
 sed -i 's/\r$//' /tmp/proxy_emby.sh
 bash /tmp/proxy_emby.sh "$@"
 EOF_SC
-        chmod +x /usr/local/bin/emby-proxy
-        echo -e "${GREEN}>>> 快捷指令 emby-proxy 已创建生效！${RESET}"
-    fi
+    chmod +x /usr/local/bin/emby-proxy
 
     echo -e "${GREEN}==========================================${RESET}"
     echo -e "🎉 面板安装/更新完成！"
