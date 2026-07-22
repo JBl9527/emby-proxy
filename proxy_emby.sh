@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==========================================
 # Emby 多端口中转发车面板 (完整版)
-# 功能: 多规则中转 / 密码修改 / 域名更换 / BBR 加速
+# 功能: 多规则中转 / 延迟检测 / 在线编辑 / 密码修改 / 域名更换 / BBR
 # ==========================================
 
 GREEN="\033[32m"
@@ -75,7 +75,6 @@ change_password() {
     fi
     echo "$p1" > /opt/emby-proxy/password.txt
     chmod 600 /opt/emby-proxy/password.txt
-    # 删除 session 密钥并重启面板，强制所有已登录会话下线
     rm -f /opt/emby-proxy/secret.key
     systemctl restart emby-proxy-web
     echo -e "${GREEN}✅ 密码已修改，所有会话已注销，请用新密码重新登录${RESET}"
@@ -103,7 +102,6 @@ change_domain() {
         return
     fi
 
-    # DNS 预检：新域名没解析到本机就换，等于把自己锁在面板外
     PUBLIC_IP=$(curl -s4 --max-time 8 ifconfig.me 2>/dev/null || true)
     RESOLVED=$(getent ahostsv4 "$NEW_DOMAIN" 2>/dev/null | awk 'NR==1{print $1}')
     if [ -n "$PUBLIC_IP" ] && [ "$RESOLVED" != "$PUBLIC_IP" ]; then
@@ -188,6 +186,8 @@ import json
 import os
 import re
 import secrets
+import socket
+import time
 
 app = Flask(__name__)
 
@@ -200,7 +200,6 @@ CADDYFILE = '/etc/caddy/Caddyfile'
 RESERVED_PORTS = {80, 443, 5000}
 HOST_RE = re.compile(r'^(?=.{1,253}$)[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$')
 
-# session 密钥: 每机随机生成, 硬编码=任何人可伪造登录
 def get_secret():
     if not os.path.exists(SECRET_FILE):
         with open(SECRET_FILE, 'w') as f:
@@ -250,9 +249,29 @@ def norm_rule(data):
         return None, 'VPS 端口 %s 与面板/Caddy 保留端口冲突' % vport
     return {'emby_host': host, 'emby_port': eport, 'vps_port': vport}, None
 
+def tcp_latency(host, port, count=3, timeout=2):
+    """测量 VPS 到目标 host:port 的 TCP 建连时间(≈RTT)，返回毫秒；全部失败返回 None"""
+    times = []
+    for _ in range(count):
+        s = None
+        try:
+            start = time.monotonic()
+            s = socket.create_connection((host, port), timeout=timeout)
+            times.append((time.monotonic() - start) * 1000)
+        except Exception:
+            pass
+        finally:
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+    if not times:
+        return None
+    return int(sum(times) / len(times))
+
 def generate_and_reload_caddy():
-    """生成完整 Caddyfile -> 校验通过才落地 -> 同步 reload 并检查结果。
-    磁盘上永远保留最后一份有效配置，这是重启后能正常启动的关键。"""
+    """生成完整 Caddyfile -> 校验通过才落地 -> 同步 reload 并检查结果。"""
     domain = get_domain()
     rules = load_rules()
     content = "%s {\n    reverse_proxy 127.0.0.1:5000\n}\n\n" % domain
@@ -327,15 +346,18 @@ PANEL_HTML = """
     <title>Emby 中转管理核心</title>
     <style>
         body { font-family: 'Segoe UI', Tahoma, sans-serif; background-color: #f4f7f6; margin: 0; padding: 40px 20px; }
-        .container { max-width: 860px; margin: 0 auto; background: #fff; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); }
+        .container { max-width: 900px; margin: 0 auto; background: #fff; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); }
         .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #eee; padding-bottom: 15px; margin-bottom: 30px; flex-wrap: wrap; gap: 10px; }
         h2 { color: #333; margin: 0; }
         .btn-update { background: #f39c12; color: white; padding: 8px 15px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; }
         .btn-pass { background: #3498db; color: white; padding: 8px 15px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; }
+        .btn-ping { background: #9b59b6; color: white; padding: 8px 15px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; }
         .btn-logout { background: #95a5a6; color: white; padding: 8px 15px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; text-decoration: none; }
         .add-form { display: flex; gap: 10px; margin-bottom: 30px; flex-wrap: wrap; }
         input { flex: 1; min-width: 150px; padding: 10px; border: 1px solid #ddd; border-radius: 6px; }
         button.add-btn { padding: 10px 20px; background: #00b09b; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; }
+        button.cancel-btn { padding: 10px 20px; background: #95a5a6; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; }
+        button.edit-btn { background: #3498db; color: white; padding: 6px 12px; border: none; border-radius: 6px; cursor: pointer; margin-right: 6px; }
         button.delete-btn { background: #ff4757; color: white; padding: 6px 12px; border: none; border-radius: 6px; cursor: pointer; }
         table { width: 100%; border-collapse: collapse; margin-top: 10px; }
         th, td { text-align: left; padding: 12px; border-bottom: 1px solid #eee; }
@@ -349,18 +371,20 @@ PANEL_HTML = """
         <div class="header">
             <h2>🚀 Emby 中转控制台</h2>
             <div>
+                <button class="btn-ping" onclick="loadRules()">📶 重新检测延迟</button>
                 <button class="btn-pass" onclick="changePass()">🔑 修改密码</button>
-                <button class="btn-update" onclick="updateScript()">🔄 从 GitHub 拉取更新</button>
-                <a class="btn-logout" href="/logout">🚪 退出登录</a>
+                <button class="btn-update" onclick="updateScript()">🔄 拉取更新</button>
+                <a class="btn-logout" href="/logout">🚪 退出</a>
             </div>
         </div>
 
-        <h3>➕ 添加转发规则</h3>
+        <h3 id="formTitle">➕ 添加转发规则</h3>
         <div class="add-form">
             <input type="text" id="embyHost" placeholder="目标 (如: paolu.emby.media)" />
             <input type="number" id="embyPort" placeholder="目标端口 (如: 443)" />
             <input type="number" id="vpsPort" placeholder="VPS 开放端口 (如: 8888)" />
-            <button class="add-btn" onclick="addRule()">保存并应用</button>
+            <button class="add-btn" id="saveBtn" onclick="saveRule()">保存并应用</button>
+            <button class="cancel-btn" id="cancelBtn" onclick="cancelEdit()" style="display:none">取消</button>
         </div>
         <div id="status"></div>
 
@@ -371,6 +395,7 @@ PANEL_HTML = """
                     <th>访问地址 (客户端填这个)</th>
                     <th>目标地址</th>
                     <th>目标端口</th>
+                    <th>延迟</th>
                     <th>操作</th>
                 </tr>
             </thead>
@@ -379,6 +404,7 @@ PANEL_HTML = """
     </div>
 
     <script>
+        let editingPort = null;
         window.onload = loadRules;
 
         async function loadRules() {
@@ -388,16 +414,41 @@ PANEL_HTML = """
             tbody.innerHTML = '';
             data.rules.forEach(rule => {
                 const url = 'https://' + data.domain + ':' + rule.vps_port;
+                const pingId = 'ping-' + rule.vps_port;
                 tbody.innerHTML += '<tr>' +
                     '<td><a class="link" href="' + url + '" target="_blank"><strong>' + url + '</strong></a></td>' +
                     '<td>' + rule.emby_host + '</td>' +
                     '<td>' + rule.emby_port + '</td>' +
-                    '<td><button class="delete-btn" onclick="deleteRule(' + rule.vps_port + ')">删除并释放</button></td>' +
+                    '<td id="' + pingId + '"><span style="color:#999">检测中...</span></td>' +
+                    '<td>' +
+                        '<button class="edit-btn" onclick="editRule(\'' + rule.emby_host + '\',' + rule.emby_port + ',' + rule.vps_port + ')">编辑</button>' +
+                        '<button class="delete-btn" onclick="deleteRule(' + rule.vps_port + ')">删除并释放</button>' +
+                    '</td>' +
                     '</tr>';
+                pingRule(rule.emby_host, rule.emby_port, pingId);
             });
         }
 
-        async function addRule() {
+        async function pingRule(host, port, cellId) {
+            const cell = document.getElementById(cellId);
+            try {
+                const res = await fetch('/api/ping', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ emby_host: host, emby_port: port }) });
+                const result = await res.json();
+                if (result.latency === null || result.latency === undefined) {
+                    cell.innerHTML = '<span style="color:#ff4757;font-weight:bold">不可达</span>';
+                } else {
+                    const ms = result.latency;
+                    let color = '#00b09b';
+                    if (ms > 300) color = '#ff4757';
+                    else if (ms > 100) color = '#f39c12';
+                    cell.innerHTML = '<span style="color:' + color + ';font-weight:bold">' + ms + ' ms</span>';
+                }
+            } catch (e) {
+                cell.innerHTML = '<span style="color:#999">检测失败</span>';
+            }
+        }
+
+        async function saveRule() {
             const status = document.getElementById('status');
             const data = {
                 emby_host: document.getElementById('embyHost').value.trim(),
@@ -407,16 +458,16 @@ PANEL_HTML = """
             if (!data.emby_host || !data.emby_port || !data.vps_port) {
                 status.style.color = 'red'; status.innerText = '请填写完整！'; return;
             }
+            const isEdit = (editingPort !== null);
+            if (isEdit) data.old_vps_port = editingPort;
             status.style.color = '#333'; status.innerText = '⚙️ 正在校验并写入配置...';
             try {
-                const res = await fetch('/api/add', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+                const res = await fetch(isEdit ? '/api/edit' : '/api/add', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
                 const result = await res.json();
                 if (result.success) {
                     status.style.color = 'green';
-                    status.innerText = '✅ 添加成功！访问地址: ' + result.url;
-                    document.getElementById('embyHost').value = '';
-                    document.getElementById('embyPort').value = '';
-                    document.getElementById('vpsPort').value = '';
+                    status.innerText = (isEdit ? '✅ 修改成功！' : '✅ 添加成功！') + '访问地址: ' + result.url;
+                    cancelEdit();
                     loadRules();
                 } else {
                     status.style.color = 'red'; status.innerText = '❌ ' + result.message;
@@ -424,10 +475,34 @@ PANEL_HTML = """
             } catch (err) { status.style.color = 'red'; status.innerText = '网络错误'; }
         }
 
+        function editRule(host, eport, vport) {
+            editingPort = vport;
+            document.getElementById('embyHost').value = host;
+            document.getElementById('embyPort').value = eport;
+            document.getElementById('vpsPort').value = vport;
+            document.getElementById('formTitle').innerText = '✏️ 修改规则 (原端口: ' + vport + ')';
+            document.getElementById('saveBtn').innerText = '保存修改';
+            document.getElementById('cancelBtn').style.display = 'inline-block';
+            window.scrollTo(0, 0);
+        }
+
+        function cancelEdit() {
+            editingPort = null;
+            document.getElementById('embyHost').value = '';
+            document.getElementById('embyPort').value = '';
+            document.getElementById('vpsPort').value = '';
+            document.getElementById('formTitle').innerText = '➕ 添加转发规则';
+            document.getElementById('saveBtn').innerText = '保存并应用';
+            document.getElementById('cancelBtn').style.display = 'none';
+        }
+
         async function deleteRule(vpsPort) {
             if (!confirm('确定要删除端口 ' + vpsPort + ' 吗？系统将自动解除占用。')) return;
             const res = await fetch('/api/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ vps_port: vpsPort }) });
-            if ((await res.json()).success) loadRules();
+            if ((await res.json()).success) {
+                if (editingPort === vpsPort) cancelEdit();
+                loadRules();
+            }
         }
 
         async function changePass() {
@@ -487,6 +562,18 @@ def index():
 def list_rules():
     return jsonify({"domain": get_domain(), "rules": load_rules()})
 
+@app.route('/api/ping', methods=['POST'])
+def ping_rule():
+    data = request.get_json(silent=True) or {}
+    host = str(data.get('emby_host', '')).strip()
+    try:
+        port = int(data.get('emby_port'))
+    except (TypeError, ValueError):
+        return jsonify({"success": False, "message": "参数错误"})
+    if not HOST_RE.match(host) or not (1 <= port <= 65535):
+        return jsonify({"success": False, "message": "参数错误"})
+    return jsonify({"success": True, "latency": tcp_latency(host, port)})
+
 @app.route('/api/add', methods=['POST'])
 def add_rule():
     rule, err = norm_rule(request.get_json(silent=True) or {})
@@ -508,6 +595,55 @@ def add_rule():
         generate_and_reload_caddy()
     except Exception as e:
         rules.pop()
+        save_rules(rules)
+        try:
+            generate_and_reload_caddy()
+        except Exception:
+            pass
+        return jsonify({"success": False, "message": str(e)})
+
+    return jsonify({"success": True, "url": "https://%s:%s" % (get_domain(), rule['vps_port'])})
+
+@app.route('/api/edit', methods=['POST'])
+def edit_rule():
+    data = request.get_json(silent=True) or {}
+    try:
+        old_port = int(data.get('old_vps_port'))
+    except (TypeError, ValueError):
+        return jsonify({"success": False, "message": "缺少原端口参数"})
+
+    rule, err = norm_rule(data)
+    if err:
+        return jsonify({"success": False, "message": err})
+
+    rules = load_rules()
+    idx = None
+    for i, r in enumerate(rules):
+        if int(r['vps_port']) == old_port:
+            idx = i
+            break
+    if idx is None:
+        return jsonify({"success": False, "message": "原规则不存在（可能已被删除）"})
+
+    # 新端口与其他规则冲突检查（排除自己）
+    for i, r in enumerate(rules):
+        if i != idx and int(r['vps_port']) == rule['vps_port']:
+            return jsonify({"success": False, "message": "新 VPS 端口已被其他规则占用"})
+
+    # 换了端口才需要检查系统占用（没换则仍是 caddy 自己持有）
+    if rule['vps_port'] != old_port:
+        r = subprocess.run(['ss', '-lntHp', 'sport = :%s' % rule['vps_port']],
+                           capture_output=True, text=True)
+        if r.stdout.strip() and 'caddy' not in r.stdout:
+            return jsonify({"success": False, "message": "端口 %s 已被其他程序占用" % rule['vps_port']})
+
+    backup = rules[idx]
+    rules[idx] = rule
+    save_rules(rules)
+    try:
+        generate_and_reload_caddy()
+    except Exception as e:
+        rules[idx] = backup
         save_rules(rules)
         try:
             generate_and_reload_caddy()
@@ -543,7 +679,6 @@ def change_password_api():
     with open(PASS_FILE, 'w') as f:
         f.write(new)
     os.chmod(PASS_FILE, 0o600)
-    # 轮换 session 密钥，使所有旧登录态立即失效
     with open(SECRET_FILE, 'w') as f:
         f.write(secrets.token_hex(32))
     os.chmod(SECRET_FILE, 0o600)
@@ -592,7 +727,6 @@ $USER_DOMAIN {
 }
 EOF
 
-    # 已有规则时回写完整配置
     if [ -s /opt/emby-proxy/config.json ] && [ "$(cat /opt/emby-proxy/config.json)" != "[]" ]; then
         (cd /opt/emby-proxy && python3 -c "from app import generate_and_reload_caddy; generate_and_reload_caddy()") \
             || systemctl reload-or-restart caddy
@@ -604,7 +738,6 @@ EOF
     systemctl is-active --quiet caddy || echo -e "${RED}⚠️ caddy 未在运行，请 journalctl -u caddy -n 50 排查${RESET}"
     systemctl is-active --quiet emby-proxy-web || echo -e "${RED}⚠️ 面板服务未在运行，请 journalctl -u emby-proxy-web -n 50 排查${RESET}"
 
-    # ========== 本次唯一修改点：快捷指令改为"下载到文件再执行"+破缓存参数 ==========
     if [ ! -f "/usr/local/bin/emby-proxy" ]; then
         cat > /usr/local/bin/emby-proxy <<'EOF_SC'
 #!/bin/bash
