@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==========================================
-# Emby 多端口中转发车面板 (防死锁增强版)
+# Emby 多端口中转发车面板 (防死锁 & 修复前端崩溃版)
 # ==========================================
 
 GREEN="\033[32m"
@@ -49,6 +49,7 @@ install_or_update() {
         apt install -y caddy > /dev/null 2>&1
     fi
 
+    # 写入后端与前端代码
     cat << 'EOF' > /opt/emby-proxy/app.py
 from flask import Flask, request, jsonify, session, redirect, url_for
 import subprocess
@@ -104,8 +105,8 @@ def generate_and_reload_caddy():
     with open('/etc/caddy/Caddyfile', 'w') as f:
         f.write(caddyfile_content)
     
-    # 修复死锁：绕过 systemctl，直接调用 Caddy 原生命令重载，并设置 10 秒超时
-    subprocess.run(['caddy', 'reload', '--config', '/etc/caddy/Caddyfile'], check=True, timeout=10)
+    # 彻底解决死锁问题：直接后台静默重载，不阻塞 Python 进程
+    os.system('systemctl reload caddy >/dev/null 2>&1 &')
 
 LOGIN_HTML = """
 <!DOCTYPE html>
@@ -237,13 +238,14 @@ PANEL_HTML = """
         }
 
         async function deleteRule(vpsPort) {
-            if(!confirm(`确定要删除端口 ${vpsPort} 吗？系统将自动解除占用。`)) return;
+            if(!confirm("确定要删除端口 " + vpsPort + " 吗？系统将自动解除占用。")) return;
             const res = await fetch('/api/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ vps_port: vpsPort }) });
             if ((await res.json()).success) loadRules();
         }
 
         async function updateScript() {
-            if(!confirm("确定要拉取 GitHub 最新代码并更新面板吗？\n\n期间面板会重启，大约需要等待 5-10 秒。")) return;
+            // 已修复：使用 \\n 规避 Python 字符转义导致的 JS 语法错误
+            if(!confirm("确定要拉取 GitHub 最新代码并更新面板吗？\\n\\n期间面板会重启，大约需要等待 5-10 秒。")) return;
             try {
                 await fetch('/api/update', { method: 'POST' });
                 alert("指令已下发！系统将在后台静默更新，请在 10 秒后手动刷新页面。");
@@ -298,7 +300,7 @@ def add_rule():
         rules.pop()
         save_rules(rules)
         generate_and_reload_caddy()
-        return jsonify({"success": False, "message": "配置错误或重载超时"})
+        return jsonify({"success": False, "message": "配置错误或重载失败"})
 
 @app.route('/api/delete', methods=['POST'])
 def delete_rule():
@@ -310,7 +312,6 @@ def delete_rule():
 
 @app.route('/api/update', methods=['POST'])
 def update_script():
-    # 修复死锁：使用 Popen 完全脱离当前进程挂起执行，保证 API 瞬间返回
     subprocess.Popen("sleep 2 && /usr/local/bin/emby-proxy 2", shell=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return jsonify({"success": True})
 
