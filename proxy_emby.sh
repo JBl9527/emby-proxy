@@ -1,29 +1,22 @@
 #!/bin/bash
 # ==========================================
-# Emby 多端口中转发车面板 (终端菜单 & 快捷指令版)
+# Emby 多端口中转发车面板 (防死锁增强版)
 # ==========================================
 
-# 颜色定义
 GREEN="\033[32m"
 RED="\033[31m"
 YELLOW="\033[33m"
 RESET="\033[0m"
 
-# 确保以 Root 运行
 if [ "$EUID" -ne 0 ]; then
   echo -e "${RED}请使用 root 用户运行此脚本${RESET}"
   exit 1
 fi
 
-# ==========================================
-# 核心安装/更新逻辑
-# ==========================================
 install_or_update() {
     echo -e "${GREEN}>>> 正在初始化 Emby 中转面板环境...${RESET}"
-
     mkdir -p /opt/emby-proxy
 
-    # 1. 智能交互配置 (如果已存在则静默读取，防止覆盖)
     if [ -f "/opt/emby-proxy/domain.txt" ]; then
         USER_DOMAIN=$(cat /opt/emby-proxy/domain.txt)
         echo -e "${YELLOW}>>> 检测到已配置域名: $USER_DOMAIN，保留原配置${RESET}"
@@ -39,12 +32,10 @@ install_or_update() {
         echo "$WEB_PASSWORD" > /opt/emby-proxy/password.txt
     fi
 
-    # 初始化配置表，防止覆盖现有转发规则
     if [ ! -f "/opt/emby-proxy/config.json" ]; then
         echo "[]" > /opt/emby-proxy/config.json
     fi
 
-    # 2. 安装依赖环境
     echo -e "${GREEN}>>> 正在检查并安装依赖环境 (Python, Caddy)...${RESET}"
     apt update -y > /dev/null 2>&1
     apt install -y python3 python3-pip python3-flask curl > /dev/null 2>&1
@@ -58,7 +49,6 @@ install_or_update() {
         apt install -y caddy > /dev/null 2>&1
     fi
 
-    # 3. 写入最新版本的 Python 后端代码 (每次更新都会重写以保证代码最新)
     cat << 'EOF' > /opt/emby-proxy/app.py
 from flask import Flask, request, jsonify, session, redirect, url_for
 import subprocess
@@ -113,7 +103,9 @@ def generate_and_reload_caddy():
 """
     with open('/etc/caddy/Caddyfile', 'w') as f:
         f.write(caddyfile_content)
-    subprocess.run(['systemctl', 'reload', 'caddy'], check=True)
+    
+    # 修复死锁：绕过 systemctl，直接调用 Caddy 原生命令重载，并设置 10 秒超时
+    subprocess.run(['caddy', 'reload', '--config', '/etc/caddy/Caddyfile'], check=True, timeout=10)
 
 LOGIN_HTML = """
 <!DOCTYPE html>
@@ -306,7 +298,7 @@ def add_rule():
         rules.pop()
         save_rules(rules)
         generate_and_reload_caddy()
-        return jsonify({"success": False, "message": "配置错误或端口被占用"})
+        return jsonify({"success": False, "message": "配置错误或重载超时"})
 
 @app.route('/api/delete', methods=['POST'])
 def delete_rule():
@@ -318,14 +310,14 @@ def delete_rule():
 
 @app.route('/api/update', methods=['POST'])
 def update_script():
-    os.system("bash -c 'sleep 1; emby-proxy 2' &")
+    # 修复死锁：使用 Popen 完全脱离当前进程挂起执行，保证 API 瞬间返回
+    subprocess.Popen("sleep 2 && /usr/local/bin/emby-proxy 2", shell=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return jsonify({"success": True})
 
 if __name__ == '__main__':
     app.run(host='127.0.0.1', port=5000)
 EOF
 
-    # 4. 配置 Systemd 服务
     cat << EOF > /etc/systemd/system/emby-proxy-web.service
 [Unit]
 Description=Emby Proxy Web UI
@@ -346,7 +338,6 @@ EOF
     systemctl enable emby-proxy-web > /dev/null 2>&1
     systemctl restart emby-proxy-web
 
-    # 5. 融合已有的转发规则并重启 Caddy
     cat << EOF > /etc/caddy/Caddyfile
 $USER_DOMAIN {
     reverse_proxy 127.0.0.1:5000
@@ -359,7 +350,6 @@ EOF
         systemctl restart caddy
     fi
 
-    # 6. 生成全局快捷指令
     if [ ! -f "/usr/local/bin/emby-proxy" ]; then
         echo 'bash <(curl -sL https://raw.githubusercontent.com/JBl9527/emby-proxy/main/proxy_emby.sh) $1' > /usr/local/bin/emby-proxy
         chmod +x /usr/local/bin/emby-proxy
@@ -373,9 +363,6 @@ EOF
     echo -e "${GREEN}==========================================${RESET}"
 }
 
-# ==========================================
-# 卸载逻辑
-# ==========================================
 uninstall_panel() {
     echo -e "${RED}>>> 警告：你正在执行彻底卸载操作！${RESET}"
     read -p "将删除所有配置、释放所有端口。确认卸载吗？(y/n): " confirm
@@ -387,10 +374,8 @@ uninstall_panel() {
     echo -e "正在停止服务并删除相关文件..."
     systemctl stop emby-proxy-web caddy 2>/dev/null
     systemctl disable emby-proxy-web caddy 2>/dev/null
-    
     rm -f /etc/systemd/system/emby-proxy-web.service
     systemctl daemon-reload
-    
     rm -rf /opt/emby-proxy
     rm -f /etc/caddy/Caddyfile
     rm -f /usr/local/bin/emby-proxy
@@ -398,9 +383,6 @@ uninstall_panel() {
     echo -e "${GREEN}✅ 卸载完成！所有相关文件和服务已彻底清理干净。${RESET}"
 }
 
-# ==========================================
-# 主控菜单入口
-# ==========================================
 show_menu() {
     echo -e "${GREEN}==========================================${RESET}"
     echo -e "   🚀 Emby 中转发车面板 - 一键管理脚本"
@@ -419,7 +401,6 @@ show_menu() {
     esac
 }
 
-# 支持带参数直接运行 (方便网页端热更新接口调用)
 if [ "$1" == "2" ]; then
     install_or_update
 else
