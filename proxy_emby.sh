@@ -1,6 +1,8 @@
 #!/bin/bash
 # ==========================================
-# Emby 多端口中转发车面板 (防死锁 & 修复前端崩溃版)
+# Emby 多端口中转发车面板 (修复重启失效版)
+# 修复: Caddyfile 先校验后落地 / 输入校验 / 规则回写
+#       session 密钥随机化 / enable caddy / 权限收紧
 # ==========================================
 
 GREEN="\033[32m"
@@ -21,47 +23,78 @@ install_or_update() {
         USER_DOMAIN=$(cat /opt/emby-proxy/domain.txt)
         echo -e "${YELLOW}>>> 检测到已配置域名: $USER_DOMAIN，保留原配置${RESET}"
     else
-        read -p "请输入你已解析到本 VPS 的管理面板域名 (如: panel.yourdomain.com): " USER_DOMAIN
+        read -r -p "请输入你已解析到本 VPS 的管理面板域名 (如: panel.yourdomain.com): " USER_DOMAIN
+        USER_DOMAIN=$(echo "$USER_DOMAIN" | tr -d '[:space:]')
+        if ! [[ "$USER_DOMAIN" =~ ^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}$ ]]; then
+            echo -e "${RED}域名格式不正确，安装中止${RESET}"
+            exit 1
+        fi
         echo "$USER_DOMAIN" > /opt/emby-proxy/domain.txt
     fi
+    chmod 600 /opt/emby-proxy/domain.txt
 
     if [ -f "/opt/emby-proxy/password.txt" ]; then
         echo -e "${YELLOW}>>> 检测到已配置密码，保留原配置${RESET}"
     else
-        read -p "请设置 Web 面板的登录密码 (必填，用于安全防护): " WEB_PASSWORD
+        read -r -s -p "请设置 Web 面板的登录密码 (输入不显示): " WEB_PASSWORD
+        echo ""
+        if [ -z "$WEB_PASSWORD" ]; then
+            echo -e "${RED}密码不能为空${RESET}"
+            exit 1
+        fi
         echo "$WEB_PASSWORD" > /opt/emby-proxy/password.txt
     fi
+    chmod 600 /opt/emby-proxy/password.txt
 
     if [ ! -f "/opt/emby-proxy/config.json" ]; then
         echo "[]" > /opt/emby-proxy/config.json
     fi
+    chmod 600 /opt/emby-proxy/config.json
 
     echo -e "${GREEN}>>> 正在检查并安装依赖环境 (Python, Caddy)...${RESET}"
     apt update -y > /dev/null 2>&1
     apt install -y python3 python3-pip python3-flask curl > /dev/null 2>&1
-    pip3 install Flask --break-system-packages > /dev/null 2>&1
+    pip3 install Flask --break-system-packages > /dev/null 2>&1 || pip3 install Flask > /dev/null 2>&1 || true
 
     if ! command -v caddy &> /dev/null; then
         apt install -y debian-keyring debian-archive-keyring apt-transport-https
-        curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg --yes
-        curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list
+        curl -1sLf --max-time 30 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg --yes
+        curl -1sLf --max-time 30 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list > /dev/null
         apt update -y > /dev/null 2>&1
         apt install -y caddy > /dev/null 2>&1
     fi
+    command -v caddy >/dev/null 2>&1 || { echo -e "${RED}Caddy 安装失败，中止${RESET}"; exit 1; }
 
-    # 写入后端与前端代码
+    # ---------- 后端 + 前端 ----------
     cat << 'EOF' > /opt/emby-proxy/app.py
 from flask import Flask, request, jsonify, session, redirect, url_for
 import subprocess
 import json
 import os
+import re
+import secrets
 
 app = Flask(__name__)
-app.secret_key = "emby_proxy_super_secret_key"
 
 CONFIG_FILE = '/opt/emby-proxy/config.json'
 DOMAIN_FILE = '/opt/emby-proxy/domain.txt'
 PASS_FILE = '/opt/emby-proxy/password.txt'
+SECRET_FILE = '/opt/emby-proxy/secret.key'
+CADDYFILE = '/etc/caddy/Caddyfile'
+
+RESERVED_PORTS = {80, 443, 5000}
+HOST_RE = re.compile(r'^(?=.{1,253}$)[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$')
+
+# session 密钥: 每机随机生成, 不再硬编码(硬编码=任何人可伪造登录)
+def get_secret():
+    if not os.path.exists(SECRET_FILE):
+        with open(SECRET_FILE, 'w') as f:
+            f.write(secrets.token_hex(32))
+        os.chmod(SECRET_FILE, 0o600)
+    with open(SECRET_FILE, 'r') as f:
+        return f.read().strip()
+
+app.secret_key = get_secret()
 
 def get_domain():
     with open(DOMAIN_FILE, 'r') as f:
@@ -73,40 +106,78 @@ def get_password():
 
 def load_rules():
     if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, 'r') as f:
-            return json.load(f)
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                return json.load(f)
+        except Exception:
+            return []
     return []
 
 def save_rules(rules):
-    with open(CONFIG_FILE, 'w') as f:
+    tmp = CONFIG_FILE + '.tmp'
+    with open(tmp, 'w') as f:
         json.dump(rules, f, indent=4)
+    os.replace(tmp, CONFIG_FILE)  # 原子写入, 防止写一半断电损坏
+    os.chmod(CONFIG_FILE, 0o600)
+
+def norm_rule(data):
+    """校验并归一化一条转发规则, 返回 (rule, error)"""
+    host = str(data.get('emby_host', '')).strip()
+    try:
+        eport = int(data.get('emby_port'))
+        vport = int(data.get('vps_port'))
+    except (TypeError, ValueError):
+        return None, '端口必须是数字'
+    if not HOST_RE.match(host) or '..' in host:
+        return None, '目标地址格式不正确（只允许域名或 IPv4）'
+    if not (1 <= eport <= 65535) or not (1 <= vport <= 65535):
+        return None, '端口必须在 1-65535 之间'
+    if vport in RESERVED_PORTS:
+        return None, 'VPS 端口 %s 与面板/Caddy 保留端口冲突' % vport
+    return {'emby_host': host, 'emby_port': eport, 'vps_port': vport}, None
 
 def generate_and_reload_caddy():
+    """生成完整 Caddyfile -> 校验通过才落地 -> 同步 reload 并检查结果。
+    磁盘上永远保留最后一份有效配置, 这是重启后能正常启动的关键。"""
     domain = get_domain()
     rules = load_rules()
-    caddyfile_content = f"{domain} {{\n    reverse_proxy 127.0.0.1:5000\n}}\n\n"
-    
+    content = "%s {\n    reverse_proxy 127.0.0.1:5000\n}\n\n" % domain
+
     for rule in rules:
-        emby_host = rule['emby_host']
-        emby_port = rule['emby_port']
-        vps_port = rule['vps_port']
-        scheme = "https" if str(emby_port) in ["443", "8920"] else "http"
-        transport_block = """
-        transport http {
-            tls_insecure_skip_verify
-        }""" if scheme == "https" else ""
-        
-        caddyfile_content += f"""{domain}:{vps_port} {{
-    reverse_proxy {scheme}://{emby_host}:{emby_port} {{
-        header_up Host "{emby_host}"{transport_block}
-    }}
-}}
-"""
-    with open('/etc/caddy/Caddyfile', 'w') as f:
-        f.write(caddyfile_content)
-    
-    # 彻底解决死锁问题：直接后台静默重载，不阻塞 Python 进程
-    os.system('systemctl reload caddy >/dev/null 2>&1 &')
+        host = rule['emby_host']
+        eport = int(rule['emby_port'])
+        vport = int(rule['vps_port'])
+        scheme = "https" if eport in (443, 8920) else "http"
+        if scheme == "https":
+            proxy = ("reverse_proxy {\n"
+                     "        to https://%s:%s\n"
+                     "        header_up Host %s\n"
+                     "        transport http {\n"
+                     "            tls_insecure_skip_verify\n"
+                     "        }\n"
+                     "    }" % (host, eport, host))
+        else:
+            proxy = "reverse_proxy http://%s:%s" % (host, eport)
+        content += "%s:%s {\n    %s\n}\n\n" % (domain, vport, proxy)
+
+    tmp = CADDYFILE + '.tmp'
+    with open(tmp, 'w') as f:
+        f.write(content)
+
+    # 校验失败: 删除临时文件并抛错, 不污染磁盘配置
+    r = subprocess.run(['caddy', 'validate', '--config', tmp, '--adapter', 'caddyfile'],
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        os.remove(tmp)
+        raise RuntimeError('Caddy 配置校验失败: ' + (r.stderr or r.stdout)[-200:])
+
+    os.replace(tmp, CADDYFILE)
+
+    # 同步 reload, 失败抛错让调用方回滚规则
+    r = subprocess.run(['systemctl', 'reload', 'caddy'],
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        raise RuntimeError('caddy reload 失败: ' + (r.stderr or '')[-200:])
 
 LOGIN_HTML = """
 <!DOCTYPE html>
@@ -144,7 +215,7 @@ PANEL_HTML = """
     <title>Emby 中转管理核心</title>
     <style>
         body { font-family: 'Segoe UI', Tahoma, sans-serif; background-color: #f4f7f6; margin: 0; padding: 40px 20px; }
-        .container { max-width: 800px; margin: 0 auto; background: #fff; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); }
+        .container { max-width: 860px; margin: 0 auto; background: #fff; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); }
         .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid #eee; padding-bottom: 15px; margin-bottom: 30px; }
         h2 { color: #333; margin: 0; }
         .btn-update { background: #f39c12; color: white; padding: 8px 15px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; margin-right: 10px; }
@@ -156,7 +227,8 @@ PANEL_HTML = """
         table { width: 100%; border-collapse: collapse; margin-top: 10px; }
         th, td { text-align: left; padding: 12px; border-bottom: 1px solid #eee; }
         th { background-color: #f8f9fa; color: #555; }
-        #status { margin-top: 15px; font-size: 14px; font-weight: bold; }
+        a.link { color: #00b09b; text-decoration: none; }
+        #status { margin-top: 15px; font-size: 14px; font-weight: bold; word-break: break-all; }
     </style>
 </head>
 <body>
@@ -168,7 +240,7 @@ PANEL_HTML = """
                 <a class="btn-logout" href="/logout">🚪 退出登录</a>
             </div>
         </div>
-        
+
         <h3>➕ 添加转发规则</h3>
         <div class="add-form">
             <input type="text" id="embyHost" placeholder="目标 (如: paolu.emby.media)" />
@@ -182,7 +254,7 @@ PANEL_HTML = """
         <table>
             <thead>
                 <tr>
-                    <th>VPS 端口</th>
+                    <th>访问地址 (客户端填这个)</th>
                     <th>目标地址</th>
                     <th>目标端口</th>
                     <th>操作</th>
@@ -197,17 +269,17 @@ PANEL_HTML = """
 
         async function loadRules() {
             const res = await fetch('/api/list');
-            const rules = await res.json();
+            const data = await res.json();
             const tbody = document.getElementById('ruleList');
             tbody.innerHTML = '';
-            rules.forEach(rule => {
-                tbody.innerHTML += `
-                    <tr>
-                        <td><strong>${rule.vps_port}</strong></td>
-                        <td>${rule.emby_host}</td>
-                        <td>${rule.emby_port}</td>
-                        <td><button class="delete-btn" onclick="deleteRule(${rule.vps_port})">删除并释放</button></td>
-                    </tr>`;
+            data.rules.forEach(rule => {
+                const url = 'https://' + data.domain + ':' + rule.vps_port;
+                tbody.innerHTML += '<tr>' +
+                    '<td><a class="link" href="' + url + '" target="_blank"><strong>' + url + '</strong></a></td>' +
+                    '<td>' + rule.emby_host + '</td>' +
+                    '<td>' + rule.emby_port + '</td>' +
+                    '<td><button class="delete-btn" onclick="deleteRule(' + rule.vps_port + ')">删除并释放</button></td>' +
+                    '</tr>';
             });
         }
 
@@ -219,36 +291,36 @@ PANEL_HTML = """
                 vps_port: parseInt(document.getElementById('vpsPort').value)
             };
             if (!data.emby_host || !data.emby_port || !data.vps_port) {
-                status.style.color = 'red'; status.innerText = "请填写完整！"; return;
+                status.style.color = 'red'; status.innerText = '请填写完整！'; return;
             }
-            status.style.color = '#333'; status.innerText = "⚙️ 正在写入配置...";
+            status.style.color = '#333'; status.innerText = '⚙️ 正在校验并写入配置...';
             try {
                 const res = await fetch('/api/add', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
                 const result = await res.json();
                 if (result.success) {
-                    status.style.color = 'green'; status.innerText = "✅ 添加成功！";
+                    status.style.color = 'green';
+                    status.innerText = '✅ 添加成功！访问地址: ' + result.url;
                     document.getElementById('embyHost').value = '';
                     document.getElementById('embyPort').value = '';
                     document.getElementById('vpsPort').value = '';
                     loadRules();
                 } else {
-                    status.style.color = 'red'; status.innerText = "❌ " + result.message;
+                    status.style.color = 'red'; status.innerText = '❌ ' + result.message;
                 }
-            } catch (err) { status.innerText = "网络错误"; }
+            } catch (err) { status.style.color = 'red'; status.innerText = '网络错误'; }
         }
 
         async function deleteRule(vpsPort) {
-            if(!confirm("确定要删除端口 " + vpsPort + " 吗？系统将自动解除占用。")) return;
+            if (!confirm('确定要删除端口 ' + vpsPort + ' 吗？系统将自动解除占用。')) return;
             const res = await fetch('/api/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ vps_port: vpsPort }) });
             if ((await res.json()).success) loadRules();
         }
 
         async function updateScript() {
-            // 已修复：使用 \\n 规避 Python 字符转义导致的 JS 语法错误
-            if(!confirm("确定要拉取 GitHub 最新代码并更新面板吗？\\n\\n期间面板会重启，大约需要等待 5-10 秒。")) return;
+            if (!confirm('确定要拉取 GitHub 最新代码并更新面板吗？期间面板会重启，约 5-10 秒。')) return;
             try {
                 await fetch('/api/update', { method: 'POST' });
-                alert("指令已下发！系统将在后台静默更新，请在 10 秒后手动刷新页面。");
+                alert('指令已下发！系统将在后台静默更新，请在 10 秒后手动刷新页面。');
             } catch (err) {}
         }
     </script>
@@ -282,54 +354,78 @@ def index():
 
 @app.route('/api/list', methods=['GET'])
 def list_rules():
-    return jsonify(load_rules())
+    return jsonify({"domain": get_domain(), "rules": load_rules()})
 
 @app.route('/api/add', methods=['POST'])
 def add_rule():
-    data = request.json
+    rule, err = norm_rule(request.get_json(silent=True) or {})
+    if err:
+        return jsonify({"success": False, "message": err})
+
     rules = load_rules()
-    for rule in rules:
-        if rule['vps_port'] == data['vps_port']:
-            return jsonify({"success": False, "message": "端口已存在！"})
-    rules.append(data)
+    if any(int(r['vps_port']) == rule['vps_port'] for r in rules):
+        return jsonify({"success": False, "message": "该 VPS 端口已被其他规则占用！"})
+
+    # 端口被系统里其他程序占用的检查（caddy 占用视为自己上次的配置）
+    r = subprocess.run(['ss', '-lntHp', 'sport = :%s' % rule['vps_port']],
+                       capture_output=True, text=True)
+    if r.stdout.strip() and 'caddy' not in r.stdout:
+        return jsonify({"success": False, "message": "端口 %s 已被其他程序占用" % rule['vps_port']})
+
+    rules.append(rule)
     save_rules(rules)
     try:
         generate_and_reload_caddy()
-        return jsonify({"success": True})
     except Exception as e:
+        # 失败回滚规则, 并恢复旧配置
         rules.pop()
         save_rules(rules)
-        generate_and_reload_caddy()
-        return jsonify({"success": False, "message": "配置错误或重载失败"})
+        try:
+            generate_and_reload_caddy()
+        except Exception:
+            pass
+        return jsonify({"success": False, "message": str(e)})
+
+    return jsonify({"success": True, "url": "https://%s:%s" % (get_domain(), rule['vps_port'])})
 
 @app.route('/api/delete', methods=['POST'])
 def delete_rule():
-    vps_port = request.json.get('vps_port')
+    try:
+        vps_port = int(request.json.get('vps_port'))
+    except (TypeError, ValueError):
+        return jsonify({"success": False, "message": "端口参数错误"})
     rules = load_rules()
-    save_rules([r for r in rules if r['vps_port'] != vps_port])
-    generate_and_reload_caddy()
+    save_rules([r for r in rules if int(r['vps_port']) != vps_port])
+    try:
+        generate_and_reload_caddy()
+    except Exception:
+        pass
     return jsonify({"success": True})
 
 @app.route('/api/update', methods=['POST'])
 def update_script():
-    subprocess.Popen("sleep 2 && /usr/local/bin/emby-proxy 2", shell=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.Popen("sleep 2 && /usr/local/bin/emby-proxy 2", shell=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return jsonify({"success": True})
 
 if __name__ == '__main__':
     app.run(host='127.0.0.1', port=5000)
 EOF
 
+    # ---------- Systemd ----------
     cat << EOF > /etc/systemd/system/emby-proxy-web.service
 [Unit]
 Description=Emby Proxy Web UI
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 User=root
 WorkingDirectory=/opt/emby-proxy
 ExecStart=/usr/bin/python3 app.py
-Restart=always
+Restart=on-failure
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
@@ -337,22 +433,33 @@ EOF
 
     systemctl daemon-reload
     systemctl enable emby-proxy-web > /dev/null 2>&1
+    systemctl enable caddy > /dev/null 2>&1   # 显式确保 Caddy 开机自启
     systemctl restart emby-proxy-web
 
+    # ---------- 生成 Caddyfile ----------
+    # 先写面板站点（兜底，保证 Caddy 至少能起）
     cat << EOF > /etc/caddy/Caddyfile
 $USER_DOMAIN {
     reverse_proxy 127.0.0.1:5000
 }
 EOF
 
+    # 已有规则时回写完整配置（修复点：cd 进目录再 import，否则必然失败）
     if [ -s /opt/emby-proxy/config.json ] && [ "$(cat /opt/emby-proxy/config.json)" != "[]" ]; then
-        python3 -c "from app import generate_and_reload_caddy; generate_and_reload_caddy()" 2>/dev/null
+        (cd /opt/emby-proxy && python3 -c "from app import generate_and_reload_caddy; generate_and_reload_caddy()") \
+            || systemctl reload-or-restart caddy
     else
-        systemctl restart caddy
+        systemctl reload-or-restart caddy
     fi
+
+    # 安装后自检：确认两个服务都活着
+    sleep 1
+    systemctl is-active --quiet caddy || echo -e "${RED}⚠️ caddy 未在运行，请 journalctl -u caddy -n 50 排查${RESET}"
+    systemctl is-active --quiet emby-proxy-web || echo -e "${RED}⚠️ 面板服务未在运行，请 journalctl -u emby-proxy-web -n 50 排查${RESET}"
 
     if [ ! -f "/usr/local/bin/emby-proxy" ]; then
         echo 'bash <(curl -sL https://raw.githubusercontent.com/JBl9527/emby-proxy/main/proxy_emby.sh) $1' > /usr/local/bin/emby-proxy
+        chmod +x /usr/bin/emby-proxy 2>/dev/null
         chmod +x /usr/local/bin/emby-proxy
         echo -e "${GREEN}>>> 快捷指令 emby-proxy 已创建生效！${RESET}"
     fi
@@ -366,7 +473,7 @@ EOF
 
 uninstall_panel() {
     echo -e "${RED}>>> 警告：你正在执行彻底卸载操作！${RESET}"
-    read -p "将删除所有配置、释放所有端口。确认卸载吗？(y/n): " confirm
+    read -r -p "将删除所有配置、释放所有端口。确认卸载吗？(y/n): " confirm
     if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
         echo -e "${YELLOW}>>> 已取消卸载操作。${RESET}"
         exit 0
@@ -378,10 +485,10 @@ uninstall_panel() {
     rm -f /etc/systemd/system/emby-proxy-web.service
     systemctl daemon-reload
     rm -rf /opt/emby-proxy
-    rm -f /etc/caddy/Caddyfile
+    rm -f /etc/caddy/Caddyfile /etc/caddy/Caddyfile.tmp
     rm -f /usr/local/bin/emby-proxy
-    
-    echo -e "${GREEN}✅ 卸载完成！所有相关文件和服务已彻底清理干净。${RESET}"
+
+    echo -e "${GREEN}✅ 卸载完成！（Caddy 软件包保留，如需删除: apt remove caddy）${RESET}"
 }
 
 show_menu() {
@@ -392,7 +499,7 @@ show_menu() {
     echo -e "  ${YELLOW}2.${RESET} 🗑️  彻底卸载 面板"
     echo -e "  ${YELLOW}0.${RESET} ❌  退出脚本"
     echo -e "${GREEN}==========================================${RESET}"
-    read -p "请输入数字选择操作: " choice
+    read -r -p "请输入数字选择操作: " choice
 
     case $choice in
         1) install_or_update ;;
