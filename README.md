@@ -1,3 +1,4 @@
+一款emby中转管理面板
 ```bash
 bash <(curl -sL https://raw.githubusercontent.com/JBl9527/emby-proxy/main/proxy_emby.sh)
 ```
