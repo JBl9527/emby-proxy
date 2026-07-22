@@ -1,67 +1,72 @@
 #!/bin/bash
 # ==========================================
-# Emby 多端口中转发车面板 (安全加强 & 热更新版)
+# Emby 多端口中转发车面板 (终端菜单 & 快捷指令版)
 # ==========================================
 
+# 颜色定义
+GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
+RESET="\033[0m"
+
+# 确保以 Root 运行
 if [ "$EUID" -ne 0 ]; then
-  echo "请使用 root 用户运行此脚本"
+  echo -e "${RED}请使用 root 用户运行此脚本${RESET}"
   exit 1
 fi
 
-echo ">>> 正在初始化 Emby 中转面板环境..."
+# ==========================================
+# 核心安装/更新逻辑
+# ==========================================
+install_or_update() {
+    echo -e "${GREEN}>>> 正在初始化 Emby 中转面板环境...${RESET}"
 
-# 创建工作目录
-mkdir -p /opt/emby-proxy
+    mkdir -p /opt/emby-proxy
 
-# 1. 智能交互配置 (支持热更新时静默跳过)
-if [ -f "/opt/emby-proxy/domain.txt" ]; then
-    USER_DOMAIN=$(cat /opt/emby-proxy/domain.txt)
-    echo ">>> 检测到已配置域名: $USER_DOMAIN，跳过输入"
-else
-    read -p "请输入你已解析到本 VPS 的管理面板域名 (如: panel.yourdomain.com): " USER_DOMAIN
-    echo "$USER_DOMAIN" > /opt/emby-proxy/domain.txt
-fi
+    # 1. 智能交互配置 (如果已存在则静默读取，防止覆盖)
+    if [ -f "/opt/emby-proxy/domain.txt" ]; then
+        USER_DOMAIN=$(cat /opt/emby-proxy/domain.txt)
+        echo -e "${YELLOW}>>> 检测到已配置域名: $USER_DOMAIN，保留原配置${RESET}"
+    else
+        read -p "请输入你已解析到本 VPS 的管理面板域名 (如: panel.yourdomain.com): " USER_DOMAIN
+        echo "$USER_DOMAIN" > /opt/emby-proxy/domain.txt
+    fi
 
-if [ -f "/opt/emby-proxy/password.txt" ]; then
-    WEB_PASSWORD=$(cat /opt/emby-proxy/password.txt)
-    echo ">>> 检测到已配置密码，跳过输入"
-else
-    read -p "请设置 Web 面板的登录密码 (必填，用于安全防护): " WEB_PASSWORD
-    echo "$WEB_PASSWORD" > /opt/emby-proxy/password.txt
-fi
+    if [ -f "/opt/emby-proxy/password.txt" ]; then
+        echo -e "${YELLOW}>>> 检测到已配置密码，保留原配置${RESET}"
+    else
+        read -p "请设置 Web 面板的登录密码 (必填，用于安全防护): " WEB_PASSWORD
+        echo "$WEB_PASSWORD" > /opt/emby-proxy/password.txt
+    fi
 
-if [ ! -f "/opt/emby-proxy/config.json" ]; then
-    echo "[]" > /opt/emby-proxy/config.json
-fi
+    # 初始化配置表，防止覆盖现有转发规则
+    if [ ! -f "/opt/emby-proxy/config.json" ]; then
+        echo "[]" > /opt/emby-proxy/config.json
+    fi
 
-# 2. 清理可能冲突的老程序
-systemctl stop realm 2>/dev/null
-systemctl disable realm 2>/dev/null
+    # 2. 安装依赖环境
+    echo -e "${GREEN}>>> 正在检查并安装依赖环境 (Python, Caddy)...${RESET}"
+    apt update -y > /dev/null 2>&1
+    apt install -y python3 python3-pip python3-flask curl > /dev/null 2>&1
+    pip3 install Flask --break-system-packages > /dev/null 2>&1
 
-# 3. 安装依赖 (如果已安装会自动跳过)
-echo ">>> 正在检查并安装依赖环境..."
-apt update -y
-apt install -y python3 python3-pip python3-flask curl
-pip3 install Flask --break-system-packages 2>/dev/null
+    if ! command -v caddy &> /dev/null; then
+        apt install -y debian-keyring debian-archive-keyring apt-transport-https
+        curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg --yes
+        curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list
+        apt update -y > /dev/null 2>&1
+        apt install -y caddy > /dev/null 2>&1
+    fi
 
-# 4. 安装 Caddy
-if ! command -v caddy &> /dev/null; then
-    apt install -y debian-keyring debian-archive-keyring apt-transport-https
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg --yes
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list
-    apt update -y
-    apt install -y caddy
-fi
-
-# 5. 生成 Python 后端与带密码验证的 UI 完整代码
-cat << 'EOF' > /opt/emby-proxy/app.py
+    # 3. 写入最新版本的 Python 后端代码 (每次更新都会重写以保证代码最新)
+    cat << 'EOF' > /opt/emby-proxy/app.py
 from flask import Flask, request, jsonify, session, redirect, url_for
 import subprocess
 import json
 import os
 
 app = Flask(__name__)
-app.secret_key = "emby_proxy_super_secret_key" # 用于 Session 加密
+app.secret_key = "emby_proxy_super_secret_key"
 
 CONFIG_FILE = '/opt/emby-proxy/config.json'
 DOMAIN_FILE = '/opt/emby-proxy/domain.txt'
@@ -88,7 +93,6 @@ def save_rules(rules):
 def generate_and_reload_caddy():
     domain = get_domain()
     rules = load_rules()
-    
     caddyfile_content = f"{domain} {{\n    reverse_proxy 127.0.0.1:5000\n}}\n\n"
     
     for rule in rules:
@@ -250,7 +254,7 @@ PANEL_HTML = """
             if(!confirm("确定要拉取 GitHub 最新代码并更新面板吗？\n\n期间面板会重启，大约需要等待 5-10 秒。")) return;
             try {
                 await fetch('/api/update', { method: 'POST' });
-                alert("指令已下发！系统正在后台静默更新，请在 10 秒后手动刷新本页面。");
+                alert("指令已下发！系统将在后台静默更新，请在 10 秒后手动刷新页面。");
             } catch (err) {}
         }
     </script>
@@ -258,7 +262,6 @@ PANEL_HTML = """
 </html>
 """
 
-# --- 路由拦截器：强制登录验证 ---
 @app.before_request
 def require_login():
     if request.endpoint not in ['login', 'static'] and not session.get('logged_in'):
@@ -271,7 +274,7 @@ def login():
             session['logged_in'] = True
             return redirect(url_for('index'))
         else:
-            return "<script>alert('密码错误！你是不是想跑路？');window.location.href='/login';</script>"
+            return "<script>alert('密码错误！');window.location.href='/login';</script>"
     return LOGIN_HTML
 
 @app.route('/logout')
@@ -283,7 +286,6 @@ def logout():
 def index():
     return PANEL_HTML
 
-# --- API 核心逻辑 ---
 @app.route('/api/list', methods=['GET'])
 def list_rules():
     return jsonify(load_rules())
@@ -295,7 +297,6 @@ def add_rule():
     for rule in rules:
         if rule['vps_port'] == data['vps_port']:
             return jsonify({"success": False, "message": "端口已存在！"})
-            
     rules.append(data)
     save_rules(rules)
     try:
@@ -317,16 +318,15 @@ def delete_rule():
 
 @app.route('/api/update', methods=['POST'])
 def update_script():
-    # 核心热更新逻辑：在后台静默执行 GitHub 最新的 shell 脚本
-    os.system("bash -c 'sleep 1; curl -sL https://raw.githubusercontent.com/JBl9527/emby-proxy/main/proxy_emby.sh | bash' &")
+    os.system("bash -c 'sleep 1; emby-proxy 2' &")
     return jsonify({"success": True})
 
 if __name__ == '__main__':
     app.run(host='127.0.0.1', port=5000)
 EOF
 
-# 6. 配置系统服务
-cat << EOF > /etc/systemd/system/emby-proxy-web.service
+    # 4. 配置 Systemd 服务
+    cat << EOF > /etc/systemd/system/emby-proxy-web.service
 [Unit]
 Description=Emby Proxy Web UI
 After=network.target
@@ -342,25 +342,86 @@ Restart=always
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable emby-proxy-web
-systemctl restart emby-proxy-web
+    systemctl daemon-reload
+    systemctl enable emby-proxy-web > /dev/null 2>&1
+    systemctl restart emby-proxy-web
 
-# 7. 重构并重启 Caddy (如果在更新，它会自动读取 config.json 并保持现有转发)
-cat << EOF > /etc/caddy/Caddyfile
+    # 5. 融合已有的转发规则并重启 Caddy
+    cat << EOF > /etc/caddy/Caddyfile
 $USER_DOMAIN {
     reverse_proxy 127.0.0.1:5000
 }
 EOF
 
-# 如果有历史转发规则，触发一次自动重载融合
-if [ -s /opt/emby-proxy/config.json ] && [ "$(cat /opt/emby-proxy/config.json)" != "[]" ]; then
-    python3 -c "from app import generate_and_reload_caddy; generate_and_reload_caddy()" 2>/dev/null
-else
-    systemctl restart caddy
-fi
+    if [ -s /opt/emby-proxy/config.json ] && [ "$(cat /opt/emby-proxy/config.json)" != "[]" ]; then
+        python3 -c "from app import generate_and_reload_caddy; generate_and_reload_caddy()" 2>/dev/null
+    else
+        systemctl restart caddy
+    fi
 
-echo "=========================================="
-echo "🎉 安全加强版 Emby 中转面板 部署/更新完成！"
-echo "👉 请访问: https://$USER_DOMAIN"
-echo "=========================================="
+    # 6. 生成全局快捷指令
+    if [ ! -f "/usr/local/bin/emby-proxy" ]; then
+        echo 'bash <(curl -sL https://raw.githubusercontent.com/JBl9527/emby-proxy/main/proxy_emby.sh) $1' > /usr/local/bin/emby-proxy
+        chmod +x /usr/local/bin/emby-proxy
+        echo -e "${GREEN}>>> 快捷指令 emby-proxy 已创建生效！${RESET}"
+    fi
+
+    echo -e "${GREEN}==========================================${RESET}"
+    echo -e "🎉 面板安装/更新完成！"
+    echo -e "👉 请访问: https://$USER_DOMAIN"
+    echo -e "💡 日常维护只需在终端输入: ${YELLOW}emby-proxy${RESET}"
+    echo -e "${GREEN}==========================================${RESET}"
+}
+
+# ==========================================
+# 卸载逻辑
+# ==========================================
+uninstall_panel() {
+    echo -e "${RED}>>> 警告：你正在执行彻底卸载操作！${RESET}"
+    read -p "将删除所有配置、释放所有端口。确认卸载吗？(y/n): " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        echo -e "${YELLOW}>>> 已取消卸载操作。${RESET}"
+        exit 0
+    fi
+
+    echo -e "正在停止服务并删除相关文件..."
+    systemctl stop emby-proxy-web caddy 2>/dev/null
+    systemctl disable emby-proxy-web caddy 2>/dev/null
+    
+    rm -f /etc/systemd/system/emby-proxy-web.service
+    systemctl daemon-reload
+    
+    rm -rf /opt/emby-proxy
+    rm -f /etc/caddy/Caddyfile
+    rm -f /usr/local/bin/emby-proxy
+    
+    echo -e "${GREEN}✅ 卸载完成！所有相关文件和服务已彻底清理干净。${RESET}"
+}
+
+# ==========================================
+# 主控菜单入口
+# ==========================================
+show_menu() {
+    echo -e "${GREEN}==========================================${RESET}"
+    echo -e "   🚀 Emby 中转发车面板 - 一键管理脚本"
+    echo -e "${GREEN}==========================================${RESET}"
+    echo -e "  ${YELLOW}1.${RESET} 🛠️  安装 / 覆盖更新 面板"
+    echo -e "  ${YELLOW}2.${RESET} 🗑️  彻底卸载 面板"
+    echo -e "  ${YELLOW}0.${RESET} ❌  退出脚本"
+    echo -e "${GREEN}==========================================${RESET}"
+    read -p "请输入数字选择操作: " choice
+
+    case $choice in
+        1) install_or_update ;;
+        2) uninstall_panel ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}输入无效，请重新运行脚本。${RESET}" ;;
+    esac
+}
+
+# 支持带参数直接运行 (方便网页端热更新接口调用)
+if [ "$1" == "2" ]; then
+    install_or_update
+else
+    show_menu
+fi
