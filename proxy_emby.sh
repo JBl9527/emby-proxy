@@ -604,8 +604,14 @@ EOF
     systemctl is-active --quiet caddy || echo -e "${RED}⚠️ caddy 未在运行，请 journalctl -u caddy -n 50 排查${RESET}"
     systemctl is-active --quiet emby-proxy-web || echo -e "${RED}⚠️ 面板服务未在运行，请 journalctl -u emby-proxy-web -n 50 排查${RESET}"
 
+    # ========== 本次唯一修改点：快捷指令改为"下载到文件再执行"+破缓存参数 ==========
     if [ ! -f "/usr/local/bin/emby-proxy" ]; then
-        echo 'bash <(curl -sL https://raw.githubusercontent.com/JBl9527/emby-proxy/main/proxy_emby.sh) $1' > /usr/local/bin/emby-proxy
+        cat > /usr/local/bin/emby-proxy <<'EOF_SC'
+#!/bin/bash
+curl -fsSL --max-time 30 "https://raw.githubusercontent.com/JBl9527/emby-proxy/main/proxy_emby.sh?t=$(date +%s)" -o /tmp/proxy_emby.sh || { echo "下载失败"; exit 1; }
+sed -i 's/\r$//' /tmp/proxy_emby.sh
+bash /tmp/proxy_emby.sh "$@"
+EOF_SC
         chmod +x /usr/local/bin/emby-proxy
         echo -e "${GREEN}>>> 快捷指令 emby-proxy 已创建生效！${RESET}"
     fi
