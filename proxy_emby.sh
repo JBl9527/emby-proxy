@@ -211,6 +211,14 @@ def get_secret():
 
 app.secret_key = get_secret()
 
+# ===== 禁止浏览器缓存任何响应，防止旧页面残留 =====
+@app.after_request
+def add_no_cache_headers(resp):
+    resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    resp.headers['Pragma'] = 'no-cache'
+    resp.headers['Expires'] = '0'
+    return resp
+
 def get_domain():
     with open(DOMAIN_FILE, 'r') as f:
         return f.read().strip()
@@ -250,7 +258,6 @@ def norm_rule(data):
         return None, 'VPS 端口 %s 与面板/Caddy 保留端口冲突' % vport
     return {'emby_host': host, 'emby_port': eport, 'vps_port': vport}, None
 
-# ===== 延迟检测：线程池 + 硬超时（DNS 解析挂死也会被强制放弃）=====
 _ping_pool = concurrent.futures.ThreadPoolExecutor(max_workers=8)
 
 def _tcp_once(host, port, timeout):
@@ -269,7 +276,6 @@ def _tcp_once(host, port, timeout):
                 pass
 
 def tcp_latency(host, port, count=2, timeout=2):
-    """测 VPS 到 host:port 的 TCP 建连时间(≈RTT)，返回毫秒；失败返回 None"""
     times = []
     for _ in range(count):
         try:
@@ -415,14 +421,15 @@ PANEL_HTML = """
     </div>
 
     <script>
-        let editingPort = null;
+        var editingPort = null;
+        var rulesCache = [];
         window.onload = loadRules;
 
         async function loadRules() {
-            const status = document.getElementById('status');
-            let data;
+            var status = document.getElementById('status');
+            var data;
             try {
-                const res = await fetch('/api/list');
+                var res = await fetch('/api/list');
                 data = await res.json();
             } catch (e) {
                 status.style.color = 'red';
@@ -434,42 +441,42 @@ PANEL_HTML = """
                 status.innerText = '规则列表加载失败：后端返回异常';
                 return;
             }
-            const tbody = document.getElementById('ruleList');
-            // 修复点：先拼好全部行，一次性赋值，避免 innerHTML+= 循环重建导致节点失效
-            const rows = data.rules.map(rule => {
-                const url = 'https://' + data.domain + ':' + rule.vps_port;
-                const pingId = 'ping-' + rule.vps_port;
-                return '<tr>' +
+            rulesCache = data.rules;
+            var tbody = document.getElementById('ruleList');
+            var rows = [];
+            for (var i = 0; i < data.rules.length; i++) {
+                var rule = data.rules[i];
+                var url = 'https://' + data.domain + ':' + rule.vps_port;
+                rows.push('<tr>' +
                     '<td><a class="link" href="' + url + '" target="_blank"><strong>' + url + '</strong></a></td>' +
                     '<td>' + rule.emby_host + '</td>' +
                     '<td>' + rule.emby_port + '</td>' +
-                    '<td id="' + pingId + '"><span style="color:#999">检测中...</span></td>' +
+                    '<td id="ping-' + rule.vps_port + '"><span style="color:#999">检测中...</span></td>' +
                     '<td>' +
-                        '<button class="edit-btn" onclick="editRule(\'' + rule.emby_host + '\',' + rule.emby_port + ',' + rule.vps_port + ')">编辑</button>' +
+                        '<button class="edit-btn" onclick="editRule(' + i + ')">编辑</button>' +
                         '<button class="delete-btn" onclick="deleteRule(' + rule.vps_port + ')">删除并释放</button>' +
                     '</td>' +
-                    '</tr>';
-            });
+                    '</tr>');
+            }
             tbody.innerHTML = rows.join('');
-            data.rules.forEach(rule => {
-                pingRule(rule.emby_host, rule.emby_port, 'ping-' + rule.vps_port);
-            });
+            for (var j = 0; j < data.rules.length; j++) {
+                pingRule(data.rules[j].emby_host, data.rules[j].emby_port, 'ping-' + data.rules[j].vps_port);
+            }
         }
 
         async function pingRule(host, port, cellId) {
-            const cell = document.getElementById(cellId);
+            var cell = document.getElementById(cellId);
             if (!cell) return;
             try {
-                const res = await fetch('/api/ping', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ emby_host: host, emby_port: port }) });
-                const result = await res.json();
+                var res = await fetch('/api/ping', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ emby_host: host, emby_port: port }) });
+                var result = await res.json();
                 if (result.latency === null || result.latency === undefined) {
                     cell.innerHTML = '<span style="color:#ff4757;font-weight:bold">不可达</span>';
                 } else {
-                    const ms = result.latency;
-                    let color = '#00b09b';
-                    if (ms > 300) color = '#ff4757';
-                    else if (ms > 100) color = '#f39c12';
-                    cell.innerHTML = '<span style="color:' + color + ';font-weight:bold">' + ms + ' ms</span>';
+                    var color = '#00b09b';
+                    if (result.latency > 300) color = '#ff4757';
+                    else if (result.latency > 100) color = '#f39c12';
+                    cell.innerHTML = '<span style="color:' + color + ';font-weight:bold">' + result.latency + ' ms</span>';
                 }
             } catch (e) {
                 cell.innerHTML = '<span style="color:#999">检测失败</span>';
@@ -477,38 +484,51 @@ PANEL_HTML = """
         }
 
         async function saveRule() {
-            const status = document.getElementById('status');
-            const data = {
+            var status = document.getElementById('status');
+            var data = {
                 emby_host: document.getElementById('embyHost').value.trim(),
                 emby_port: parseInt(document.getElementById('embyPort').value),
                 vps_port: parseInt(document.getElementById('vpsPort').value)
             };
             if (!data.emby_host || !data.emby_port || !data.vps_port) {
-                status.style.color = 'red'; status.innerText = '请填写完整！'; return;
+                status.style.color = 'red';
+                status.innerText = '请填写完整！';
+                return;
             }
-            const isEdit = (editingPort !== null);
-            if (isEdit) data.old_vps_port = editingPort;
-            status.style.color = '#333'; status.innerText = '⚙️ 正在校验并写入配置...';
+            var isEdit = (editingPort !== null);
+            var apiUrl = '/api/add';
+            if (isEdit) {
+                data.old_vps_port = editingPort;
+                apiUrl = '/api/edit';
+            }
+            status.style.color = '#333';
+            status.innerText = '⚙️ 正在校验并写入配置...';
             try {
-                const res = await fetch(isEdit ? '/api/edit' : '/api/add', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
-                const result = await res.json();
+                var res = await fetch(apiUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+                var result = await res.json();
                 if (result.success) {
                     status.style.color = 'green';
                     status.innerText = (isEdit ? '✅ 修改成功！' : '✅ 添加成功！') + '访问地址: ' + result.url;
                     cancelEdit();
                     loadRules();
                 } else {
-                    status.style.color = 'red'; status.innerText = '❌ ' + result.message;
+                    status.style.color = 'red';
+                    status.innerText = '❌ ' + result.message;
                 }
-            } catch (err) { status.style.color = 'red'; status.innerText = '网络错误'; }
+            } catch (err) {
+                status.style.color = 'red';
+                status.innerText = '❌ 网络错误或后端无响应';
+            }
         }
 
-        function editRule(host, eport, vport) {
-            editingPort = vport;
-            document.getElementById('embyHost').value = host;
-            document.getElementById('embyPort').value = eport;
-            document.getElementById('vpsPort').value = vport;
-            document.getElementById('formTitle').innerText = '✏️ 修改规则 (原端口: ' + vport + ')';
+        function editRule(i) {
+            var rule = rulesCache[i];
+            if (!rule) return;
+            editingPort = rule.vps_port;
+            document.getElementById('embyHost').value = rule.emby_host;
+            document.getElementById('embyPort').value = rule.emby_port;
+            document.getElementById('vpsPort').value = rule.vps_port;
+            document.getElementById('formTitle').innerText = '✏️ 修改规则 (原端口: ' + rule.vps_port + ')';
             document.getElementById('saveBtn').innerText = '保存修改';
             document.getElementById('cancelBtn').style.display = 'inline-block';
             window.scrollTo(0, 0);
@@ -526,22 +546,23 @@ PANEL_HTML = """
 
         async function deleteRule(vpsPort) {
             if (!confirm('确定要删除端口 ' + vpsPort + ' 吗？系统将自动解除占用。')) return;
-            const res = await fetch('/api/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ vps_port: vpsPort }) });
-            if ((await res.json()).success) {
+            var res = await fetch('/api/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ vps_port: vpsPort }) });
+            var result = await res.json();
+            if (result.success) {
                 if (editingPort === vpsPort) cancelEdit();
                 loadRules();
             }
         }
 
         async function changePass() {
-            const oldP = prompt('请输入当前密码:');
+            var oldP = prompt('请输入当前密码:');
             if (oldP === null) return;
-            const newP = prompt('请输入新密码 (至少 6 位):');
+            var newP = prompt('请输入新密码 (至少 6 位):');
             if (newP === null) return;
-            const newP2 = prompt('请再次输入新密码:');
+            var newP2 = prompt('请再次输入新密码:');
             if (newP !== newP2) { alert('两次输入不一致'); return; }
-            const res = await fetch('/api/password', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ old_password: oldP, new_password: newP }) });
-            const result = await res.json();
+            var res = await fetch('/api/password', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ old_password: oldP, new_password: newP }) });
+            var result = await res.json();
             if (result.success) {
                 alert('密码已修改，请使用新密码重新登录');
                 window.location.href = '/login';
@@ -612,10 +633,13 @@ def add_rule():
     if any(int(r['vps_port']) == rule['vps_port'] for r in rules):
         return jsonify({"success": False, "message": "该 VPS 端口已被其他规则占用！"})
 
-    r = subprocess.run(['ss', '-lntHp', 'sport = :%s' % rule['vps_port']],
-                       capture_output=True, text=True)
-    if r.stdout.strip() and 'caddy' not in r.stdout:
-        return jsonify({"success": False, "message": "端口 %s 已被其他程序占用" % rule['vps_port']})
+    try:
+        r = subprocess.run(['ss', '-lntHp', 'sport = :%s' % rule['vps_port']],
+                           capture_output=True, text=True, timeout=10)
+        if r.stdout.strip() and 'caddy' not in r.stdout:
+            return jsonify({"success": False, "message": "端口 %s 已被其他程序占用" % rule['vps_port']})
+    except FileNotFoundError:
+        pass  # 系统没有 ss 命令时跳过占用检查
 
     rules.append(rule)
     save_rules(rules)
@@ -658,10 +682,13 @@ def edit_rule():
             return jsonify({"success": False, "message": "新 VPS 端口已被其他规则占用"})
 
     if rule['vps_port'] != old_port:
-        r = subprocess.run(['ss', '-lntHp', 'sport = :%s' % rule['vps_port']],
-                           capture_output=True, text=True)
-        if r.stdout.strip() and 'caddy' not in r.stdout:
-            return jsonify({"success": False, "message": "端口 %s 已被其他程序占用" % rule['vps_port']})
+        try:
+            r = subprocess.run(['ss', '-lntHp', 'sport = :%s' % rule['vps_port']],
+                               capture_output=True, text=True, timeout=10)
+            if r.stdout.strip() and 'caddy' not in r.stdout:
+                return jsonify({"success": False, "message": "端口 %s 已被其他程序占用" % rule['vps_port']})
+        except FileNotFoundError:
+            pass
 
     backup = rules[idx]
     rules[idx] = rule
@@ -764,7 +791,7 @@ EOF
     systemctl is-active --quiet caddy || echo -e "${RED}⚠️ caddy 未在运行，请 journalctl -u caddy -n 50 排查${RESET}"
     systemctl is-active --quiet emby-proxy-web || echo -e "${RED}⚠️ 面板服务未在运行，请 journalctl -u emby-proxy-web -n 50 排查${RESET}"
 
-    # 快捷指令：每次安装都强制覆盖为新版（破缓存+防管道冲突），不再"不存在才创建"
+    # 快捷指令：每次安装都强制覆盖为新版（破缓存+防管道冲突）
     cat > /usr/local/bin/emby-proxy <<'EOF_SC'
 #!/bin/bash
 curl -fsSL --max-time 30 "https://raw.githubusercontent.com/JBl9527/emby-proxy/main/proxy_emby.sh?t=$(date +%s)" -o /tmp/proxy_emby.sh || { echo "下载失败"; exit 1; }
